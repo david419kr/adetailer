@@ -772,6 +772,17 @@ class AfterDetailerScript(scripts.Script):
         if getattr(p, "_ad_disabled", False):
             return
 
+        if not getattr(p, "enable_hr", False) and shared.opts.data.get(
+            "ad_use_only_for_hires_fix", False
+        ):
+            p._ad_disabled = True
+            msg = (
+                "[-] ADetailer: ADetailer is only enabled for high-res fix. "
+                "You can change this behavior in the settings."
+            )
+            print(msg)
+            return
+
         if is_img2img_inpaint(p) and is_all_black(self.get_image_mask(p)):
             p._ad_disabled = True
             msg = (
@@ -984,6 +995,13 @@ def on_ui_settings():
         shared.OptionInfo(
             default=False, label="Save images before ADetailer", section=section
         ),
+    )
+
+    shared.opts.add_option(
+        "ad_use_only_for_hires_fix",
+        shared.OptionInfo(
+            default=False, label="Use ADetailer only for hires-fix", section=section
+        ).info("If enabled, ADetailer will be used only for the 'hires-fix'."),
     )
 
     shared.opts.add_option(
