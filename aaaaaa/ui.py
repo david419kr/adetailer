@@ -109,6 +109,35 @@ def on_cn_model_update(cn_model_name: str):
     return gr.update(visible=False, choices=["None"], value="None")
 
 
+def hires_timing_label(position: Any, num_models: int) -> str:
+    try:
+        position = int(position)
+    except (TypeError, ValueError):
+        position = 0
+
+    position = max(0, min(position, num_models))
+    if position == 0:
+        return f"~{ordinal(1)}"
+    if position == num_models:
+        return f"{ordinal(num_models)}~"
+    return f"{ordinal(position)}~{ordinal(position + 1)}"
+
+
+def hires_timing_hint(position: Any, num_models: int) -> str:
+    return f"Timing: `{hires_timing_label(position, num_models)}`"
+
+
+def on_hires_timing_override(enabled: bool, position: Any, *, num_models: int):
+    return (
+        gr.update(visible=enabled),
+        gr.update(visible=enabled, value=hires_timing_hint(position, num_models)),
+    )
+
+
+def on_hires_timing_position(position: Any, *, num_models: int):
+    return hires_timing_hint(position, num_models)
+
+
 def elem_id(item_id: str, n: int, is_img2img: bool) -> str:
     tab = "img2img" if is_img2img else "txt2img"
     suf = suffix(n, "_")
@@ -143,11 +172,65 @@ def adui(
                     elem_id=eid("ad_skip_img2img"),
                 )
 
-            with gr.Column(scale=1, min_width=180):
-                gr.Markdown(
-                    f"v{__version__}",
-                    elem_id=eid("ad_version"),
-                )
+            # with gr.Column(scale=1, min_width=180):
+            #     gr.Markdown(
+            #         f"v{__version__}",
+            #         elem_id=eid("ad_version"),
+            #     )
+
+        with gr.Group():
+            gr.HTML(
+                """
+                <style>
+                [id$="_ad_hires_timing_override_info"] {
+                    margin-top: -0.35rem;
+                    margin-bottom: 0.35rem;
+                }
+                [id$="_ad_hires_timing_override_info"] p {
+                    color: var(--body-text-color-subdued, #6b7280);
+                    font-size: 0.85em;
+                    line-height: 1.35;
+                    margin: 0;
+                }
+                </style>
+                """
+            )
+            ad_hires_timing_override = gr.Checkbox(
+                label="Enable hires-fix timing override",
+                value=False,
+                elem_id=eid("ad_hires_timing_override"),
+            )
+            gr.Markdown(
+                "If enabled, ADetailer will run only around the 'hires-fix' pass.",
+                elem_id=eid("ad_hires_timing_override_info"),
+            )
+            ad_hires_timing_position = gr.Slider(
+                label="Hires. fix timing",
+                minimum=0,
+                maximum=num_models,
+                step=1,
+                value=0,
+                visible=False,
+                elem_id=eid("ad_hires_timing_position"),
+            )
+            ad_hires_timing_hint = gr.Markdown(
+                value=hires_timing_hint(0, num_models),
+                visible=False,
+                elem_id=eid("ad_hires_timing_hint"),
+            )
+
+        ad_hires_timing_override.change(
+            fn=partial(on_hires_timing_override, num_models=num_models),
+            inputs=[ad_hires_timing_override, ad_hires_timing_position],
+            outputs=[ad_hires_timing_position, ad_hires_timing_hint],
+            queue=False,
+        )
+        ad_hires_timing_position.change(
+            fn=partial(on_hires_timing_position, num_models=num_models),
+            inputs=ad_hires_timing_position,
+            outputs=ad_hires_timing_hint,
+            queue=False,
+        )
 
         infotext_fields.append((ad_enable, "ADetailer enable"))
         infotext_fields.append((ad_skip_img2img, "ADetailer skip img2img"))
@@ -164,8 +247,14 @@ def adui(
                 states.append(state)
                 infotext_fields.extend(infofields)
 
-    # components: [bool, bool, dict, dict, ...]
-    components = [ad_enable, ad_skip_img2img, *states]
+    # components: [bool, bool, bool, int, dict, dict, ...]
+    components = [
+        ad_enable,
+        ad_skip_img2img,
+        ad_hires_timing_override,
+        ad_hires_timing_position,
+        *states,
+    ]
     return components, infotext_fields
 
 

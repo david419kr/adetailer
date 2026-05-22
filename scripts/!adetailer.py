@@ -89,6 +89,8 @@ if TYPE_CHECKING:
 PARAMS_TXT = "params.txt"
 OPT_AD_AFTER_HIRES_ONLY = "ad_use_only_for_hires_fix"
 OPT_AD_BEFORE_HIRES_ONLY = "ad_use_before_hires_fix"
+ARG_HIRES_TIMING_OVERRIDE = 2
+ARG_HIRES_TIMING_POSITION = 3
 
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
 adetailer_dir = Path(paths.models_path, "adetailer")
@@ -202,6 +204,30 @@ class AfterDetailerScript(scripts.Script):
                     break
         return ad_enabled and not_none
 
+    @staticmethod
+    def is_hires_timing_override_enabled(*args_) -> bool:
+        if len(args_) <= ARG_HIRES_TIMING_OVERRIDE:
+            return False
+        return args_[ARG_HIRES_TIMING_OVERRIDE] is True
+
+    @staticmethod
+    def get_hires_timing_position(*args_) -> int:
+        if len(args_) <= ARG_HIRES_TIMING_POSITION:
+            return 0
+
+        value = args_[ARG_HIRES_TIMING_POSITION]
+        if not isinstance(value, (int, float)):
+            return 0
+
+        arg_count = len([arg for arg in args_ if isinstance(arg, dict)])
+        return max(0, min(int(value), arg_count))
+
+    @classmethod
+    def get_hires_timing_indexes(cls, *args_) -> tuple[list[int], list[int]]:
+        arg_count = len([arg for arg in args_ if isinstance(arg, dict)])
+        position = cls.get_hires_timing_position(*args_)
+        return list(range(position)), list(range(position, arg_count))
+
     def set_skip_img2img(self, p, *args_) -> None:
         if (
             hasattr(p, "_ad_skip_img2img")
@@ -235,7 +261,7 @@ class AfterDetailerScript(scripts.Script):
         p.width = 128
         p.height = 128
 
-    def get_args(self, p, *args_) -> list[ADetailerArgs]:
+    def get_indexed_args(self, p, *args_) -> list[tuple[int, ADetailerArgs]]:
         args = [arg for arg in args_ if isinstance(arg, dict)]
 
         if not args:
@@ -245,22 +271,25 @@ class AfterDetailerScript(scripts.Script):
         if hasattr(p, "_ad_xyz"):
             args[0] = {**args[0], **p._ad_xyz}
 
-        all_inputs: list[ADetailerArgs] = []
+        all_inputs: list[tuple[int, ADetailerArgs]] = []
 
-        for n, arg_dict in enumerate(args, 1):
+        for index, arg_dict in enumerate(args):
             try:
                 inp = ADetailerArgs(**arg_dict)
             except ValueError:
-                msg = f"[-] ADetailer: ValidationError when validating {ordinal(n)} arguments:"
+                msg = f"[-] ADetailer: ValidationError when validating {ordinal(index + 1)} arguments:"
                 print(msg, arg_dict, file=sys.stderr)
                 continue
 
-            all_inputs.append(inp)
+            all_inputs.append((index, inp))
 
         if not all_inputs:
             msg = "[-] ADetailer: No valid arguments found."
             raise ValueError(msg)
         return all_inputs
+
+    def get_args(self, p, *args_) -> list[ADetailerArgs]:
+        return [arg for _, arg in self.get_indexed_args(p, *args_)]
 
     def extra_params(self, arg_list: list[ADetailerArgs]) -> dict:
         params = {}
@@ -783,11 +812,16 @@ class AfterDetailerScript(scripts.Script):
         return shared.opts.data.get(OPT_AD_AFTER_HIRES_ONLY, False)
 
     @classmethod
-    def use_hires_only(cls) -> bool:
+    def use_hires_only(cls, *args_) -> bool:
+        if cls.is_hires_timing_override_enabled(*args_):
+            return True
         return cls.use_before_hires_only() or cls.use_after_hires_only()
 
     @classmethod
-    def skip_final_adetailer(cls) -> bool:
+    def skip_final_adetailer(cls, *args_) -> bool:
+        if cls.is_hires_timing_override_enabled(*args_):
+            _, post_indexes = cls.get_hires_timing_indexes(*args_)
+            return not post_indexes
         return cls.use_before_hires_only() and not cls.use_after_hires_only()
 
     @rich_traceback
@@ -795,7 +829,7 @@ class AfterDetailerScript(scripts.Script):
         if getattr(p, "_ad_disabled", False):
             return
 
-        if not getattr(p, "enable_hr", False) and self.use_hires_only():
+        if not getattr(p, "enable_hr", False) and self.use_hires_only(*args_):
             p._ad_disabled = True
             msg = (
                 "[-] ADetailer: ADetailer is only enabled for hires-fix. "
@@ -931,14 +965,27 @@ class AfterDetailerScript(scripts.Script):
         *args_,
         run_script_lifecycle: bool = True,
         before_suffix: str = "-ad-before",
+        arg_indexes: Sequence[int] | None = None,
     ) -> bool:
         if getattr(p, "_ad_disabled", False) or not self.is_ad_enabled(*args_):
+            return False
+
+        indexed_arg_list = self.get_indexed_args(p, *args_)
+        if arg_indexes is not None:
+            wanted = set(arg_indexes)
+            indexed_arg_list = [
+                (index, args) for index, args in indexed_arg_list if index in wanted
+            ]
+
+        if not indexed_arg_list:
+            return False
+
+        if all(args.need_skip() for _, args in indexed_arg_list):
             return False
 
         pp.image = self.get_i2i_init_image(p, pp)
         pp.image = ensure_pil_image(pp.image, "RGB")
         init_image = copy(pp.image)
-        arg_list = self.get_args(p, *args_)
         params_txt_content = self.read_params_txt()
 
         if run_script_lifecycle and need_call_postprocess(p):
@@ -948,7 +995,7 @@ class AfterDetailerScript(scripts.Script):
 
         is_processed = False
         with CNHijackRestore(), pause_total_tqdm(), cn_allow_script_control():
-            for n, args in enumerate(arg_list):
+            for n, args in indexed_arg_list:
                 if args.need_skip():
                     continue
                 is_processed |= self._postprocess_image_inner(p, pp, args, n=n)
@@ -969,7 +1016,18 @@ class AfterDetailerScript(scripts.Script):
 
     @rich_traceback
     def postprocess_image(self, p, pp: PPImage, *args_):
-        if self.skip_final_adetailer():
+        if self.is_hires_timing_override_enabled(*args_):
+            if not getattr(p, "enable_hr", False):
+                return
+
+            _, post_indexes = self.get_hires_timing_indexes(*args_)
+            if not post_indexes:
+                return
+
+            self.run_adetailer_on_image(p, pp, *args_, arg_indexes=post_indexes)
+            return
+
+        if self.skip_final_adetailer(*args_):
             return
 
         self.run_adetailer_on_image(p, pp, *args_)
@@ -989,6 +1047,26 @@ def _find_adetailer_runner(p) -> tuple[AfterDetailerScript, Sequence[Any]] | Non
         return script, p.script_args[script.args_from : script.args_to]
 
     return None
+
+
+def _has_enabled_ad_args(
+    ad_script: AfterDetailerScript,
+    p,
+    ad_args: Sequence[Any],
+    arg_indexes: Sequence[int] | None,
+) -> bool:
+    try:
+        indexed_arg_list = ad_script.get_indexed_args(p, *ad_args)
+    except ValueError:
+        return False
+
+    if arg_indexes is not None:
+        wanted = set(arg_indexes)
+        indexed_arg_list = [
+            (index, args) for index, args in indexed_arg_list if index in wanted
+        ]
+
+    return any(not args.need_skip() for _, args in indexed_arg_list)
 
 
 def _tensor_to_pil_images(tensor) -> list[Image.Image] | None:
@@ -1096,7 +1174,7 @@ def _restore_parent_batch_scripts(p) -> None:
 
 
 def _run_adetailer_before_hires(p, samples, decoded_samples):
-    if getattr(p, "_ad_disabled", False) or not AfterDetailerScript.use_before_hires_only():
+    if getattr(p, "_ad_disabled", False):
         return samples, decoded_samples
 
     if not getattr(p, "enable_hr", False):
@@ -1107,7 +1185,19 @@ def _run_adetailer_before_hires(p, samples, decoded_samples):
         return samples, decoded_samples
 
     ad_script, ad_args = found
+    if AfterDetailerScript.is_hires_timing_override_enabled(*ad_args):
+        pre_indexes, _ = AfterDetailerScript.get_hires_timing_indexes(*ad_args)
+        if not pre_indexes:
+            return samples, decoded_samples
+    elif AfterDetailerScript.use_before_hires_only():
+        pre_indexes = None
+    else:
+        return samples, decoded_samples
+
     if not ad_script.is_ad_enabled(*ad_args):
+        return samples, decoded_samples
+
+    if not _has_enabled_ad_args(ad_script, p, ad_args, pre_indexes):
         return samples, decoded_samples
 
     pil_images = _decode_pre_hires_samples(p, samples, decoded_samples)
@@ -1134,6 +1224,7 @@ def _run_adetailer_before_hires(p, samples, decoded_samples):
                 *ad_args,
                 run_script_lifecycle=False,
                 before_suffix="-ad-before-hires",
+                arg_indexes=pre_indexes,
             )
             processed_images.append(pp.image)
     finally:
