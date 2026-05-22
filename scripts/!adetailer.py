@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import gradio as gr
+import numpy as np
+import torch
 from PIL import Image, ImageChops
 from rich import print  # noqa: A004  Shadowing built-in 'print'
 
@@ -67,21 +69,26 @@ from controlnet_ext import (
     controlnet_type,
     get_cn_models,
 )
-from modules import images, paths, script_callbacks, scripts, shared
+from modules import devices, errors, images, paths, script_callbacks, scripts, shared
 from modules.devices import NansException
 from modules.processing import (
     Processed,
     StableDiffusionProcessingImg2Img,
+    StableDiffusionProcessingTxt2Img,
     create_infotext,
+    decode_latent_batch,
     process_images,
 )
 from modules.sd_samplers import all_samplers
+from modules.sd_samplers_common import approximation_indexes, images_tensor_to_samples
 from modules.shared import cmd_opts, opts, state
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
 PARAMS_TXT = "params.txt"
+OPT_AD_AFTER_HIRES_ONLY = "ad_use_only_for_hires_fix"
+OPT_AD_BEFORE_HIRES_ONLY = "ad_use_before_hires_fix"
 
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
 adetailer_dir = Path(paths.models_path, "adetailer")
@@ -767,17 +774,31 @@ class AfterDetailerScript(scripts.Script):
                 p2.width, p2.height, pred.bboxes[j]
             )
 
+    @staticmethod
+    def use_before_hires_only() -> bool:
+        return shared.opts.data.get(OPT_AD_BEFORE_HIRES_ONLY, False)
+
+    @staticmethod
+    def use_after_hires_only() -> bool:
+        return shared.opts.data.get(OPT_AD_AFTER_HIRES_ONLY, False)
+
+    @classmethod
+    def use_hires_only(cls) -> bool:
+        return cls.use_before_hires_only() or cls.use_after_hires_only()
+
+    @classmethod
+    def skip_final_adetailer(cls) -> bool:
+        return cls.use_before_hires_only() and not cls.use_after_hires_only()
+
     @rich_traceback
     def process(self, p, *args_):
         if getattr(p, "_ad_disabled", False):
             return
 
-        if not getattr(p, "enable_hr", False) and shared.opts.data.get(
-            "ad_use_only_for_hires_fix", False
-        ):
+        if not getattr(p, "enable_hr", False) and self.use_hires_only():
             p._ad_disabled = True
             msg = (
-                "[-] ADetailer: ADetailer is only enabled for high-res fix. "
+                "[-] ADetailer: ADetailer is only enabled for hires-fix. "
                 "You can change this behavior in the settings."
             )
             print(msg)
@@ -903,10 +924,16 @@ class AfterDetailerScript(scripts.Script):
 
         return False
 
-    @rich_traceback
-    def postprocess_image(self, p, pp: PPImage, *args_):
+    def run_adetailer_on_image(
+        self,
+        p,
+        pp: PPImage,
+        *args_,
+        run_script_lifecycle: bool = True,
+        before_suffix: str = "-ad-before",
+    ) -> bool:
         if getattr(p, "_ad_disabled", False) or not self.is_ad_enabled(*args_):
-            return
+            return False
 
         pp.image = self.get_i2i_init_image(p, pp)
         pp.image = ensure_pil_image(pp.image, "RGB")
@@ -914,7 +941,7 @@ class AfterDetailerScript(scripts.Script):
         arg_list = self.get_args(p, *args_)
         params_txt_content = self.read_params_txt()
 
-        if need_call_postprocess(p):
+        if run_script_lifecycle and need_call_postprocess(p):
             dummy = Processed(p, [], p.seed, "")
             with preserve_prompts(p):
                 p.scripts.postprocess(copy(p), dummy)
@@ -928,16 +955,261 @@ class AfterDetailerScript(scripts.Script):
 
         if is_processed and not is_skip_img2img(p):
             self.save_image(
-                p, init_image, condition="ad_save_images_before", suffix="-ad-before"
+                p, init_image, condition="ad_save_images_before", suffix=before_suffix
             )
 
-        if need_call_process(p):
+        if run_script_lifecycle and need_call_process(p):
             with preserve_prompts(p):
                 copy_p = copy(p)
                 p.scripts.before_process(copy_p)
                 p.scripts.process(copy_p)
 
         self.write_params_txt(params_txt_content)
+        return is_processed
+
+    @rich_traceback
+    def postprocess_image(self, p, pp: PPImage, *args_):
+        if self.skip_final_adetailer():
+            return
+
+        self.run_adetailer_on_image(p, pp, *args_)
+
+
+def _find_adetailer_runner(p) -> tuple[AfterDetailerScript, Sequence[Any]] | None:
+    if p.scripts is None or not hasattr(p, "script_args"):
+        return None
+
+    for script in p.scripts.alwayson_scripts:
+        if script.__class__.__name__ != "AfterDetailerScript":
+            continue
+
+        if not hasattr(script, "run_adetailer_on_image"):
+            continue
+
+        return script, p.script_args[script.args_from : script.args_to]
+
+    return None
+
+
+def _tensor_to_pil_images(tensor) -> list[Image.Image] | None:
+    if tensor is None:
+        return None
+
+    if isinstance(tensor, list):
+        if not tensor:
+            return []
+        tensor = torch.stack(tensor).float()
+
+    if len(tensor.shape) == 5:
+        tensor = tensor.squeeze(1)
+
+    if len(tensor.shape) != 4:
+        print(
+            f"[-] ADetailer: before hires-fix skipped for unsupported tensor shape {tuple(tensor.shape)}."
+        )
+        return None
+
+    tensor = tensor.detach().cpu().float()
+    if torch.min(tensor) < 0:
+        tensor = torch.clamp((tensor + 1.0) / 2.0, min=0.0, max=1.0)
+    else:
+        tensor = torch.clamp(tensor, min=0.0, max=1.0)
+
+    pil_images = []
+    for x_sample in tensor:
+        x_sample = 255.0 * np.moveaxis(x_sample.numpy(), 0, 2)
+        x_sample = x_sample.astype(np.uint8)
+        pil_images.append(Image.fromarray(x_sample).convert("RGB"))
+    return pil_images
+
+
+def _pil_images_to_tensor(pil_images: Sequence[Image.Image]):
+    batch_images = []
+    for image in pil_images:
+        array = np.array(image.convert("RGB")).astype(np.float32) / 255.0
+        array = np.moveaxis(array, 2, 0)
+        batch_images.append(array)
+
+    return torch.from_numpy(np.array(batch_images)).float()
+
+
+def _decode_pre_hires_samples(p, samples, decoded_samples) -> list[Image.Image] | None:
+    if decoded_samples is not None:
+        return _tensor_to_pil_images(decoded_samples)
+
+    if samples is None:
+        return None
+
+    decoded = decode_latent_batch(
+        p.sd_model, samples, target_device=devices.cpu, check_for_nans=True
+    )
+    decoded = torch.stack(decoded).float()
+    decoded = torch.clamp((decoded + 1.0) / 2.0, min=0.0, max=1.0)
+    return _tensor_to_pil_images(decoded)
+
+
+def _encode_pre_hires_images(p, pil_images: Sequence[Image.Image], samples):
+    image_tensor = _pil_images_to_tensor(pil_images)
+
+    if p.latent_scale_mode is None:
+        return samples, image_tensor
+
+    image_tensor = image_tensor.to(shared.device, dtype=torch.float32)
+    if opts.sd_vae_encode_method != "Full":
+        p.extra_generation_params["VAE Encoder"] = opts.sd_vae_encode_method
+
+    encoded_samples = images_tensor_to_samples(
+        image_tensor,
+        approximation_indexes.get(opts.sd_vae_encode_method),
+        p.sd_model,
+    )
+    p.sd_model.ini_latent = None
+    devices.torch_gc()
+    return encoded_samples, None
+
+
+def _reset_processing_condition_cache(p) -> None:
+    empty_cache = [None, None, None]
+    for name in ("cached_c", "cached_uc", "cached_hr_c", "cached_hr_uc"):
+        if hasattr(p, name):
+            setattr(p, name, empty_cache.copy())
+        for cls in type(p).__mro__:
+            if hasattr(cls, name):
+                setattr(cls, name, empty_cache.copy())
+
+    p.hr_c = None
+    p.hr_uc = None
+
+
+def _restore_parent_batch_scripts(p) -> None:
+    if p.scripts is None:
+        return
+
+    with preserve_prompts(p):
+        p.scripts.process_batch(
+            p,
+            batch_number=p.iteration,
+            prompts=p.prompts,
+            seeds=p.seeds,
+            subseeds=p.subseeds,
+        )
+
+
+def _run_adetailer_before_hires(p, samples, decoded_samples):
+    if getattr(p, "_ad_disabled", False) or not AfterDetailerScript.use_before_hires_only():
+        return samples, decoded_samples
+
+    if not getattr(p, "enable_hr", False):
+        return samples, decoded_samples
+
+    found = _find_adetailer_runner(p)
+    if found is None:
+        return samples, decoded_samples
+
+    ad_script, ad_args = found
+    if not ad_script.is_ad_enabled(*ad_args):
+        return samples, decoded_samples
+
+    pil_images = _decode_pre_hires_samples(p, samples, decoded_samples)
+    if not pil_images:
+        return samples, decoded_samples
+
+    print("[-] ADetailer: running before hires-fix.")
+    original_batch_index = getattr(p, "batch_index", None)
+    has_original_batch_index = hasattr(p, "batch_index")
+    original_batch_size = p.batch_size
+    processed_images = []
+    is_processed = False
+
+    try:
+        p.batch_size = len(pil_images)
+        for index, image in enumerate(pil_images):
+            p.batch_index = index
+            pp = scripts.PostprocessImageArgs(
+                image, index + p.iteration * p.batch_size
+            )
+            is_processed |= ad_script.run_adetailer_on_image(
+                p,
+                pp,
+                *ad_args,
+                run_script_lifecycle=False,
+                before_suffix="-ad-before-hires",
+            )
+            processed_images.append(pp.image)
+    finally:
+        p.batch_size = original_batch_size
+        if has_original_batch_index:
+            p.batch_index = original_batch_index
+        elif hasattr(p, "batch_index"):
+            delattr(p, "batch_index")
+
+    if not is_processed:
+        _reset_processing_condition_cache(p)
+        _restore_parent_batch_scripts(p)
+        _reset_processing_condition_cache(p)
+        return samples, decoded_samples
+
+    print("[-] ADetailer: applied before hires-fix.")
+    samples, decoded_samples = _encode_pre_hires_images(p, processed_images, samples)
+    _reset_processing_condition_cache(p)
+    _restore_parent_batch_scripts(p)
+    _reset_processing_condition_cache(p)
+    return samples, decoded_samples
+
+
+def _sample_hr_pass_with_adetailer_before_hires(
+    original_sample_hr_pass,
+    p,
+    samples,
+    decoded_samples,
+    seeds,
+    subseeds,
+    subseed_strength,
+    prompts,
+):
+    try:
+        samples, decoded_samples = _run_adetailer_before_hires(
+            p, samples, decoded_samples
+        )
+    except Exception:
+        errors.report("Error running ADetailer before hires-fix", exc_info=True)
+
+    return original_sample_hr_pass(
+        p, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts
+    )
+
+
+def install_before_hires_patch() -> None:
+    current = StableDiffusionProcessingTxt2Img.sample_hr_pass
+    if getattr(current, "_adetailer_before_hires_patch", False):
+        original = getattr(
+            StableDiffusionProcessingTxt2Img,
+            "_adetailer_original_sample_hr_pass",
+            None,
+        )
+    else:
+        original = current
+        StableDiffusionProcessingTxt2Img._adetailer_original_sample_hr_pass = original
+
+    if original is None:
+        return
+
+    def sample_hr_pass_wrapper(
+        p, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts
+    ):
+        return _sample_hr_pass_with_adetailer_before_hires(
+            original,
+            p,
+            samples,
+            decoded_samples,
+            seeds,
+            subseeds,
+            subseed_strength,
+            prompts,
+        )
+
+    sample_hr_pass_wrapper._adetailer_before_hires_patch = True
+    StableDiffusionProcessingTxt2Img.sample_hr_pass = sample_hr_pass_wrapper
 
 
 def on_after_component(component, **_kwargs):
@@ -998,10 +1270,21 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
-        "ad_use_only_for_hires_fix",
+        OPT_AD_AFTER_HIRES_ONLY,
         shared.OptionInfo(
-            default=False, label="Use ADetailer only for hires-fix", section=section
-        ).info("If enabled, ADetailer will be used only for the 'hires-fix'."),
+            default=False,
+            label="Use ADetailer after hires-fix only",
+            section=section,
+        ).info("If enabled, ADetailer will run only after the 'hires-fix' pass."),
+    )
+
+    shared.opts.add_option(
+        OPT_AD_BEFORE_HIRES_ONLY,
+        shared.OptionInfo(
+            default=False,
+            label="Use ADetailer before hires-fix only",
+            section=section,
+        ).info("If enabled, ADetailer will run before the 'hires-fix' pass."),
     )
 
     shared.opts.add_option(
@@ -1226,6 +1509,7 @@ def add_api_endpoints(_: gr.Blocks, app: FastAPI):
         return {"ad_model": list(model_mapping)}
 
 
+install_before_hires_patch()
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(on_after_component)
 script_callbacks.on_app_started(add_api_endpoints)
