@@ -124,7 +124,7 @@ def hires_timing_label(position: Any, num_models: int) -> str:
 
 
 def hires_timing_hint(position: Any, num_models: int) -> str:
-    return f"Timing: `{hires_timing_label(position, num_models)}`"
+    return f"Hires. fix timing: `{hires_timing_label(position, num_models)}`"
 
 
 def on_hires_timing_override(enabled: bool, position: Any, *, num_models: int):
@@ -204,8 +204,13 @@ def adui(
                 "If enabled, ADetailer will run only around the 'hires-fix' pass.",
                 elem_id=eid("ad_hires_timing_override_info"),
             )
+            ad_hires_timing_hint = gr.Markdown(
+                value=hires_timing_hint(0, num_models),
+                visible=False,
+                elem_id=eid("ad_hires_timing_hint"),
+            )
             ad_hires_timing_position = gr.Slider(
-                label="Hires. fix timing",
+                label=" ",
                 minimum=0,
                 maximum=num_models,
                 step=1,
@@ -213,10 +218,11 @@ def adui(
                 visible=False,
                 elem_id=eid("ad_hires_timing_position"),
             )
-            ad_hires_timing_hint = gr.Markdown(
-                value=hires_timing_hint(0, num_models),
-                visible=False,
-                elem_id=eid("ad_hires_timing_hint"),
+            gr.HTML(
+                """
+                <br>
+                """,
+                elem_id=eid("ad_hires_timing_position_br"),
             )
 
         ad_hires_timing_override.change(
